@@ -5,7 +5,12 @@ from typing import Any
 import httpx
 
 from sera.context import MAX_TOOL_CHARS, ContextBudgetError, fit_context
-from sera.main import create_app, map_tool_call, stream_anthropic_response
+from sera.main import (
+    create_app,
+    format_tool_result,
+    map_tool_call,
+    stream_anthropic_response,
+)
 
 
 class ContextTests(unittest.IsolatedAsyncioTestCase):
@@ -144,6 +149,55 @@ class ContextTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ReadTests(unittest.TestCase):
+    def format_read(self, content, view_range=None, is_error=False):
+        args = {"command": "view", "path": "/some/TASK.md"}
+        if view_range:
+            args["view_range"] = view_range
+        map_tool_call("str_replace_editor", args, self.id())
+        return format_tool_result(self.id(), content, is_error=is_error)
+
+    def test_short_complete_read_does_not_request_another_page(self):
+        content = "\n".join(f"{i}\tline" for i in range(1, 60))
+        result = self.format_read(content)
+        self.assertIn("Returned lines 1-59", result)
+        self.assertNotIn("view_range", result)
+        self.assertIn("59\tline", result)
+
+    def test_full_page_suggests_nonoverlapping_next_range(self):
+        content = "\n".join(f"{i}→line" for i in range(201, 401))
+        result = self.format_read(content, [201, 400])
+        self.assertIn("Returned lines 201-400", result)
+        self.assertIn("view_range [401, 600]", result)
+
+    def test_beyond_eof_warning_survives_reminder_stripping_and_cache(self):
+        warning = (
+            "Warning: the file exists but is shorter than the provided offset "
+            "(200). The file has 59 lines."
+        )
+        content = (
+            f"<system-reminder>{warning}</system-reminder>"
+            "<system-reminder>Unrelated harness instruction</system-reminder>"
+        )
+        result = self.format_read(content, [200, 399])
+        self.assertIn(warning, result)
+        self.assertNotIn("Unrelated harness instruction", result)
+        self.assertNotIn("view_range", result)
+        self.assertEqual(format_tool_result(self.id(), content), result)
+
+    def test_empty_and_cached_read_notices_do_not_request_another_page(self):
+        for content in ("", "Wasted call — file unchanged since your last Read."):
+            result = self.format_read(content, [200, 399])
+            self.assertNotIn("view_range", result)
+            if content:
+                self.assertIn(content, result)
+            else:
+                self.assertIn("No content returned", result)
+
+    def test_rejected_read_is_still_an_error(self):
+        result = self.format_read("Permission denied", is_error=True)
+        self.assertIn("ERROR: The operation was NOT performed", result)
+        self.assertNotIn("view_range", result)
+
     def test_default_huge_and_open_ended_ranges_are_bounded(self):
         for view_range in (None, [10, 10000], [10, -1]):
             args = {"command": "view", "path": "/some/file.py"}

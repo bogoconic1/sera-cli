@@ -405,8 +405,16 @@ def format_tool_result(
         cc_result: The content returned by Claude Code
         is_error: True if Claude Code marked this as an error (e.g., user rejection)
     """
-    # Strip Claude Code system reminders first - they're not part of SWE-agent format
+    # Claude Code wraps beyond-EOF diagnostics in system-reminder tags too.
+    # Keep those tool observations while removing unrelated harness instructions.
+    read_warnings = re.findall(
+        r"<system-reminder>\s*(Warning: the file exists but is shorter than "
+        r"the provided offset \(\d+\)\. The file has \d+ lines\.)\s*</system-reminder>",
+        cc_result,
+    )
     cc_result = strip_system_reminders(cc_result)
+    if read_warnings:
+        cc_result = "\n".join([cc_result, *read_warnings]).strip()
 
     # Log the raw cc_result for debugging
     cc_preview = cc_result[:200].replace("\n", "\\n") if cc_result else "(empty)"
@@ -472,11 +480,21 @@ def format_tool_result(
                 # Convert Claude Code's line format (arrow) to SWE-agent's format (tab)
                 # SWE-agent adds trailing newline after content
                 converted_result = convert_line_format(cc_result).rstrip("\n")
-                formatted = (
-                    f"Here's the result of running `cat -n` on {path}:\n{converted_result}\n"
-                    f"[sera-cli: File reads return at most {MAX_READ_LINES} lines. "
-                    "Use view_range to read another section.]"
-                )
+                formatted = f"Here's the result of running `cat -n` on {path}:\n{converted_result}\n"
+                lines = re.findall(r"^\s*(\d+)\t", converted_result, re.MULTILINE)
+                if lines:
+                    # Only advertise pagination when the proxy's read cap was hit.
+                    # Short files must not look like incomplete observations.
+                    formatted += f"[sera-cli: Returned lines {lines[0]}-{lines[-1]}."
+                    if len(lines) >= MAX_READ_LINES:
+                        next_line = int(lines[-1]) + 1
+                        formatted += (
+                            f" Read limit reached; if more content is needed, use "
+                            f"view_range [{next_line}, {next_line + MAX_READ_LINES - 1}]."
+                        )
+                    formatted += "]"
+                elif not converted_result.strip():
+                    formatted += "[sera-cli: No content returned for this read.]"
 
         elif cmd == "create":
             formatted = f"File created successfully at: {path}"
