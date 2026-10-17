@@ -118,6 +118,30 @@ uv tool install ai2-sera-cli
 sera --endpoint http://your-server:8000/v1/chat/completions
 ```
 
+## Context handling
+
+The proxy budgets requests for the model's 32,768-token context window, including
+space for the requested reply. It uses the backend's `/tokenize` endpoint with the
+same messages and tool definitions; if that endpoint is unavailable it uses a
+conservative UTF-8 byte estimate with template headroom. Smaller context limits
+reported by the tokenizer are respected.
+
+File reads return at most 200 lines; use `view_range` to request another section.
+Tool observations sent to the model are capped at 12,000 characters. When a request
+still exceeds its budget, the proxy removes older tool output and then complete
+older assistant/tool exchanges, preserving user instructions and the latest
+assistant exchange. An explicit notice tells the model to reread files or inspect
+`git diff` when needed. This is lossy history reduction, not a semantic summary;
+files on disk and Claude Code's original transcript are not changed. Oversized
+instructions that cannot fit are reported explicitly rather than silently removed.
+
+Backend streaming token usage is forwarded to Claude Code, including the final
+usage-only chunk. The proxy enforces its own budget rather than relying on Claude
+Code to infer the backend's context limit from its selected model label.
+
+Run regression tests with `python -m unittest discover -s tests -v` after installing
+the package and its dependencies.
+
 ## Configuration
 
 ### `sera` CLI Options

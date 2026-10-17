@@ -33,8 +33,9 @@ import sys
 import threading
 import time
 import traceback
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Any, AsyncIterator
+from typing import Any
 
 import httpx
 import modal
@@ -42,6 +43,8 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.responses import StreamingResponse
+
+from sera.context import MAX_READ_LINES, ContextBudgetError, fit_context
 
 LOG_FILE = "/tmp/cc-proxy.log"
 logging.basicConfig(
@@ -469,7 +472,11 @@ def format_tool_result(
                 # Convert Claude Code's line format (arrow) to SWE-agent's format (tab)
                 # SWE-agent adds trailing newline after content
                 converted_result = convert_line_format(cc_result).rstrip("\n")
-                formatted = f"Here's the result of running `cat -n` on {path}:\n{converted_result}\n"
+                formatted = (
+                    f"Here's the result of running `cat -n` on {path}:\n{converted_result}\n"
+                    f"[sera-cli: File reads return at most {MAX_READ_LINES} lines. "
+                    "Use view_range to read another section.]"
+                )
 
         elif cmd == "create":
             formatted = f"File created successfully at: {path}"
@@ -536,11 +543,12 @@ def format_tool_result(
                     new_str_first_line = new_str.split("\n")[0] if new_str else ""
                     replacement_line = 0
                     for i, line in enumerate(lines):
-                        if new_str_first_line and new_str_first_line in line:
-                            replacement_line = i
-                            break
-                        elif new_str and new_str in "\n".join(
-                            lines[i : i + new_str.count("\n") + 1]
+                        if (
+                            new_str_first_line
+                            and new_str_first_line in line
+                            or new_str
+                            and new_str
+                            in "\n".join(lines[i : i + new_str.count("\n") + 1])
                         ):
                             replacement_line = i
                             break
@@ -567,7 +575,7 @@ def format_tool_result(
                         f"{formatted_snippet}\n"
                         "Review the changes and make sure they are as expected. Edit the file again if necessary."
                     )
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001 - report boundary failures to the CLI/client
                     # Fall back to simple message if file read fails
                     log.warning(f"Failed to generate snippet for {local_path}: {e}")
                     formatted = (
@@ -661,7 +669,7 @@ def convert_message(msg: dict) -> dict | list[dict]:
         tool_results = [c for c in content if c.get("type") == "tool_result"]
         if tool_results:
             # OpenAI expects separate messages for each tool result
-            return [
+            converted_results = [
                 {
                     "role": "tool",
                     "tool_call_id": tr["tool_use_id"],
@@ -675,6 +683,13 @@ def convert_message(msg: dict) -> dict | list[dict]:
                 }
                 for tr in tool_results
             ]
+            # Claude Code can attach new user instructions to tool results.
+            text = "\n".join(
+                c.get("text", "") for c in content if c.get("type") == "text"
+            )
+            if text:
+                converted_results.append({"role": role, "content": text})
+            return converted_results
 
         # Handle tool_use blocks (assistant messages with tool calls)
         # Reverse-map Claude Code tools back to SWE-agent format for model consistency
@@ -759,10 +774,19 @@ def map_tool_call(name: str, input_args: dict, tool_id: str) -> dict | None:
                 }
             # File view
             log.debug(f"map_tool: str_replace_editor view {path} -> Read")
-            cc_input: dict[str, Any] = {"file_path": path}
+            cc_input: dict[str, Any] = {
+                "file_path": path,
+                "offset": 1,
+                "limit": MAX_READ_LINES,
+            }
             if view_range and len(view_range) >= 2:
-                cc_input["offset"] = view_range[0]
-                cc_input["limit"] = view_range[1] - view_range[0] + 1
+                cc_input["offset"] = max(1, view_range[0])
+                end = view_range[1]
+                cc_input["limit"] = (
+                    MAX_READ_LINES
+                    if end == -1
+                    else max(1, min(MAX_READ_LINES, end - cc_input["offset"] + 1))
+                )
             return {
                 "type": "tool_use",
                 "id": tool_id,
@@ -849,16 +873,17 @@ def wrap_in_think_tags(text: str) -> str:
 async def stream_anthropic_response(
     openai_stream: AsyncIterator[str],
     model: str,
+    input_tokens: int = 0,
 ) -> AsyncIterator[str]:
     """Convert OpenAI streaming response to Anthropic streaming format."""
     msg_id = f"msg_{id(openai_stream)}"
     current_tool_calls: dict[int, dict] = {}  # index -> {id, name, arguments_str}
     accumulated_text = ""  # Buffer text to strip think tags at the end
-    input_tokens = 0
     output_tokens = 0
+    stop_reason = "end_turn"
 
     # Send message_start event
-    yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': model, 'stop_reason': None, 'usage': {'input_tokens': 0, 'output_tokens': 0}}})}\n\n"
+    yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': model, 'stop_reason': None, 'usage': {'input_tokens': input_tokens, 'output_tokens': 0}}})}\n\n"
 
     async for line in openai_stream:
         line_str = line.strip()
@@ -875,17 +900,19 @@ async def stream_anthropic_response(
             continue
 
         # Track usage if present
-        if "usage" in chunk:
+        if chunk.get("usage"):
             usage = chunk["usage"]
             input_tokens = usage.get("prompt_tokens", input_tokens)
             output_tokens = usage.get("completion_tokens", output_tokens)
 
-        choice = chunk.get("choices", [{}])[0]
+        if not chunk.get("choices"):
+            continue
+        choice = chunk["choices"][0]
         delta = choice.get("delta", {})
         finish_reason = choice.get("finish_reason")
 
         # Accumulate text content (will be emitted at end with think tags stripped)
-        if "content" in delta and delta["content"]:
+        if delta.get("content"):
             accumulated_text += delta["content"]
 
         # Handle tool calls
@@ -908,7 +935,7 @@ async def stream_anthropic_response(
                         current_tool_calls[tc_index]["arguments_str"] += tc["function"][
                             "arguments"
                         ]
-                if "id" in tc and tc["id"]:
+                if tc.get("id"):
                     current_tool_calls[tc_index]["id"] = tc["id"]
 
         # Handle finish
@@ -968,8 +995,8 @@ async def stream_anthropic_response(
             # Determine stop reason - only tool_use if we emitted actual tool calls
             stop_reason = "tool_use" if emitted_tool_use else "end_turn"
 
-            # Send message_delta with stop_reason
-            yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason}, 'usage': {'output_tokens': output_tokens}})}\n\n"
+    # Usage may arrive in a final, choices=[] chunk after finish_reason.
+    yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason}, 'usage': {'input_tokens': input_tokens, 'output_tokens': output_tokens}})}\n\n"
 
     # Send message_stop
     yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
@@ -1001,7 +1028,7 @@ def create_app():
             anthropic_req = await request.json()
 
             # Convert messages, flattening any lists (from tool_result conversion)
-            openai_messages = []
+            openai_messages: list[dict[str, Any]] = []
 
             # Prepend system prompt if configured
             if CONFIG.system_prompt:
@@ -1027,6 +1054,7 @@ def create_app():
                 "max_tokens": requested_max_tokens,
                 "temperature": anthropic_req.get("temperature", 0),
                 "stream": True,
+                "stream_options": {"include_usage": True},
             }
 
             # Log request summary (not full JSON with repeated tool definitions)
@@ -1052,6 +1080,22 @@ def create_app():
                 current_max_tokens = openai_req["max_tokens"]
 
                 async with httpx.AsyncClient(timeout=300) as client:
+                    try:
+                        history, prompt_tokens = await fit_context(
+                            client,
+                            CONFIG.endpoint,
+                            get_vllm_request_headers(),
+                            CONFIG.model,
+                            openai_messages,
+                            SWE_AGENT_TOOLS,
+                            CONFIG.max_context_length,
+                            current_max_tokens,
+                        )
+                    except ContextBudgetError as exc:
+                        for event in generate_error_sse_events(str(exc), CONFIG.model):
+                            yield event
+                        return
+                    openai_req["messages"] = history
                     # First attempt
                     async with client.stream(
                         "POST",
@@ -1132,6 +1176,7 @@ def create_app():
                                     async for chunk in stream_anthropic_response(
                                         retry_response.aiter_lines(),
                                         CONFIG.model,
+                                        input_tokens,
                                     ):
                                         yield chunk
                                 return
@@ -1146,6 +1191,7 @@ def create_app():
                         async for chunk in stream_anthropic_response(
                             response.aiter_lines(),
                             CONFIG.model,
+                            prompt_tokens,
                         ):
                             yield chunk
 
@@ -1158,7 +1204,7 @@ def create_app():
                 },
             )
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - report boundary failures to the CLI/client
             log.error(f"Proxy error: {e}\n{traceback.format_exc()}")
             return JSONResponse(
                 status_code=500,
@@ -1206,7 +1252,7 @@ def run_claude_code(port: int) -> int:
 
     env = os.environ.copy()
     env["ANTHROPIC_BASE_URL"] = f"http://localhost:{port}"
-    proc = subprocess.run(["claude"], env=env)
+    proc = subprocess.run(["claude"], env=env, check=False)
     return proc.returncode
 
 
@@ -1245,8 +1291,8 @@ def wait_for_vllm_ready(base_url: str, timeout: int = 1200) -> bool:
                         elapsed = int(time.time() - start_time)
                         print(f" ready! (took {elapsed}s)")
                         return True
-        except Exception:
-            pass  # Server not ready yet
+        except (httpx.HTTPError, ValueError, KeyError):
+            pass  # Expected while the model server is starting.
 
         print(".", end="", flush=True)
         time.sleep(3)
@@ -1262,6 +1308,7 @@ def stop_modal_app() -> None:
     print("Stopping Modal vLLM server...")
     subprocess.run(
         ["modal", "app", "stop", MODAL_APP_NAME],
+        check=False,
         capture_output=True,
     )
     print("Modal server stopped.")

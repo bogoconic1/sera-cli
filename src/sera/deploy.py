@@ -171,7 +171,7 @@ def modal_vllm_server():
 def register_modal_function() -> None:
     """Register the Modal vLLM server function with configuration from CONFIG."""
     # Pass configuration to Modal via environment variables
-    env_dict = {
+    env_dict: dict[str, str | None] = {
         "MODAL_MODEL": CONFIG.model,
         "MODAL_NUM_GPUS": str(CONFIG.num_gpus),
     }
@@ -237,8 +237,8 @@ def wait_for_vllm_ready(
                         elapsed = int(time.time() - start_time)
                         print(f" ready! (took {elapsed}s)")
                         return True
-        except Exception:
-            pass  # Server not ready yet
+        except (httpx.HTTPError, ValueError, KeyError):
+            pass  # Expected while the model server is starting.
 
         print(".", end="", flush=True)
         time.sleep(3)
@@ -253,6 +253,7 @@ def stop_modal_app() -> None:
     print(f"Stopping Modal app '{MODAL_APP_NAME}'...")
     result = subprocess.run(
         ["modal", "app", "stop", MODAL_APP_NAME],
+        check=False,
         capture_output=True,
         text=True,
     )
@@ -283,7 +284,7 @@ def deploy() -> None:
     try:
         with modal.enable_output():
             modal_app.deploy()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - report boundary failures to the CLI/client
         print(f"Failed to deploy Modal app: {e}")
         sys.exit(1)
 
