@@ -8,12 +8,40 @@ from sera.context import MAX_TOOL_CHARS, ContextBudgetError, fit_context
 from sera.main import (
     create_app,
     format_tool_result,
+    generate_error_sse_events,
     map_tool_call,
     stream_anthropic_response,
 )
 
 
 class ContextTests(unittest.IsolatedAsyncioTestCase):
+    async def test_response_ids_survive_reused_stream_object_addresses(self):
+        import importlib
+        from unittest.mock import patch
+
+        main = importlib.import_module("sera.main")
+
+        async def chunks():
+            yield 'data: {"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}'
+            yield "data: [DONE]"
+
+        ids = []
+        # Simulate Python reusing an exhausted stream's memory address.
+        with patch.object(main, "id", return_value=1234, create=True):
+            for _ in range(3):
+                events = [e async for e in stream_anthropic_response(chunks(), "test")]
+                ids.append(json.loads(events[0].split("data: ", 1)[1])["message"]["id"])
+        self.assertEqual(len(set(ids)), len(ids))
+
+    async def test_identical_errors_get_distinct_response_ids(self):
+        ids = [
+            json.loads(
+                generate_error_sse_events("same error", "test")[0].split("data: ", 1)[1]
+            )["message"]["id"]
+            for _ in range(3)
+        ]
+        self.assertEqual(len(set(ids)), len(ids))
+
     async def fit(self, history, limit=5000, handler=None):
         def tokenize(request):
             payload = json.loads(request.content)

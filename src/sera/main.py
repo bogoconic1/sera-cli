@@ -130,7 +130,7 @@ def generate_error_sse_events(
     Returns a properly formatted streaming response that includes usage data,
     so Claude Code doesn't crash trying to access undefined usage.input_tokens.
     """
-    msg_id = f"msg_error_{hash(error_message) & 0xFFFFFFFF:08x}"
+    msg_id = f"msg_error_{secrets.token_hex(16)}"
     error_text = f"[sera-cli] {error_message}"
     output_tokens = len(error_text) // 4
 
@@ -894,7 +894,9 @@ async def stream_anthropic_response(
     input_tokens: int = 0,
 ) -> AsyncIterator[str]:
     """Convert OpenAI streaming response to Anthropic streaming format."""
-    msg_id = f"msg_{id(openai_stream)}"
+    # Object addresses are reused after streams close. Claude Code uses this ID
+    # to group content blocks, so collisions merge unrelated conversation turns.
+    msg_id = f"msg_{secrets.token_hex(16)}"
     current_tool_calls: dict[int, dict] = {}  # index -> {id, name, arguments_str}
     accumulated_text = ""  # Buffer text to strip think tags at the end
     output_tokens = 0
